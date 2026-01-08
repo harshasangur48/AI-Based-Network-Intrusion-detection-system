@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI-Based NIDS Real-Time Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+    <style>
+        /* Custom scrollbar for alert log */
+        
+        #alert-log::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        #alert-log::-webkit-scrollbar-track {
+            background: #1f2937;
+        }
+        
+        #alert-log::-webkit-scrollbar-thumb {
+            background: #4b5563;
+            border-radius: 3px;
+        }
+        
+        #alert-log::-webkit-scrollbar-thumb:hover {
+            background: #6b7280;
+        }
+        
+        .card {
+            background-color: #1f2937;
+            /* gray-800 */
+            border: 1px solid #374151;
+            /* gray-700 */
+            border-radius: 0.75rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, .1), 0 2px 4px -1px rgba(0, 0, 0, .06);
+            transition: all .3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, .1);
+        }
+        
+        .status-secure {
+            background-color: rgba(16, 185, 129, .06);
+            border-color: rgba(16, 185, 129, .12);
+            color: #34d399;
+        }
+        
+        .status-danger {
+            background-color: rgba(244, 63, 94, .06);
+            border-color: rgba(244, 63, 94, .12);
+            color: #fb7185;
+            animation: pulse-red 2s infinite;
+        }
+        
+        @keyframes pulse-red {
+            0% {
+                box-shadow: 0 0 0 0 rgba(244, 63, 94, .4);
+            }
+            70% {
+                box-shadow: 0 0 0 10px rgba(244, 63, 94, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(244, 63, 94, 0);
+            }
+        }
+        
+        .apexcharts-tooltip {
+            background: #111827 !important;
+            border-color: #374151 !important;
+            color: #fff;
+        }
+        
+        .apexcharts-tooltip-title {
+            background: #1f2937 !important;
+            border-bottom: 1px solid #374151 !important;
+        }
+    </style>
+</head>
+
+<body class="bg-gray-900 text-gray-100 font-sans min-h-screen p-4 md:p-8">
+    <!-- Control Bar -->
+    <div class="mb-6 flex flex-col md:flex-row justify-between items-center bg-gray-800 p-3 rounded-lg border border-gray-700 shadow-sm">
+        <div class="flex items-center gap-3">
+            <div id="connIndicator" class="w-3 h-3 rounded-full bg-red-500 shadow-lg shadow-red-500/50"></div>
+            <span class="text-xs font-mono text-gray-400 tracking-widest">SERVER CONNECTION</span>
+        </div>
+
+        <div class="flex flex-col md:flex-row gap-2 w-full md:w-auto mt-2 md:mt-0">
+            <input id="wsUrl" value="ws://127.0.0.1:8000/ws" class="bg-gray-900 border border-gray-600 rounded px-3 py-1.5 text-xs w-full md:w-72 focus:outline-none focus:border-blue-500 placeholder-gray-500 text-gray-300 font-mono" />
+            <input id="apiKey" placeholder="(optional) API key" class="bg-gray-900 border border-gray-600 rounded px-3 py-1.5 text-xs w-full md:w-48 focus:outline-none focus:border-blue-500 placeholder-gray-500 text-gray-300 font-mono" />
+            <button id="toggleBtn" class="bg-blue-600 hover:bg-blue-500 text-white px-4 py-1.5 rounded text-xs font-bold uppercase tracking-wider transition-colors shadow-lg shadow-blue-900/20">Connect</button>
+            <button id="healthBtn" class="bg-slate-700 hover:bg-slate-600 text-white px-4 py-1.5 rounded text-xs font-bold uppercase tracking-wider transition-colors">Check /healthz</button>
+        </div>
+    </div>
+
+    <!-- Header -->
+    <header class="mb-10 text-center">
+        <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-blue-400 via-indigo-400 to-emerald-400 drop-shadow">
+            AI-Based NIDS Dashboard
+        </h1>
+        <p class="text-gray-400 mt-3 text-lg font-light">Real-Time Network Traffic Analysis & Threat Monitoring</p>
+    </header>
+
+    <!-- Metrics Row -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <!-- Status Card -->
+        <div id="statusCard" class="card p-6 flex items-center justify-between status-secure">
+            <div>
+                <h3 class="text-xs font-bold uppercase tracking-widest opacity-80">System Status</h3>
+                <p id="statusText" class="text-2xl font-black mt-1 tracking-tight">SECURE</p>
+            </div>
+            <div class="text-4xl">🛡️</div>
+        </div>
+
+        <!-- Confidence -->
+        <div class="card p-6 bg-gray-800 border-gray-700">
+            <div class="flex justify-between items-start">
+                <div>
+                    <h3 class="text-gray-400 text-xs font-bold uppercase tracking-widest">AI Confidence</h3>
+                    <p id="confText" class="text-3xl font-bold text-white mt-1 font-mono">0%</p>
+                </div>
+                <div class="text-blue-400 bg-blue-500/10 p-2.5 rounded-lg border border-blue-500/20">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                </div>
+            </div>
+        </div>
+
+        <!-- Flows -->
+        <div class="card p-6 bg-gray-800 border-gray-700">
+            <div class="flex justify-between items-start">
+                <div>
+                    <h3 class="text-gray-400 text-xs font-bold uppercase tracking-widest">Flows Analyzed</h3>
+                    <p id="flowsText" class="text-3xl font-bold text-white mt-1 font-mono">0</p>
+                </div>
+                <div class="text-emerald-400 bg-emerald-500/10 p-2.5 rounded-lg border border-emerald-500/20">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                </div>
+            </div>
+        </div>
+
+        <!-- Attacks -->
+        <div class="card p-6 bg-gray-800 border-gray-700">
+            <div class="flex justify-between items-start">
+                <div>
+                    <h3 class="text-gray-400 text-xs font-bold uppercase tracking-widest">Attacks Detected</h3>
+                    <p id="attacksText" class="text-3xl font-bold text-rose-500 mt-1 font-mono">0</p>
+                </div>
+                <div class="text-rose-400 bg-rose-500/10 p-2.5 rounded-lg border border-rose-500/20">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <!-- Left: Traffic -->
+        <div class="lg:col-span-2 card p-6">
+            <div class="flex items-center justify-between mb-6">
+                <h2 class="text-xl font-bold text-white flex items-center gap-2">
+                    <span class="w-1.5 h-6 bg-blue-500 rounded-sm shadow-[0_0_10px_#3b82f6]"></span> Traffic Volume & Threat Level
+                </h2>
+                <div class="flex gap-4 text-xs font-mono bg-gray-900 px-3 py-1 rounded-md border border-gray-700">
+                    <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-emerald-500"></span>Benign</span>
+                    <span class="flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>Malicious</span>
+                </div>
+            </div>
+            <div id="trafficChart" class="w-full h-96"></div>
+        </div>
+
+        <!-- Right: Donut + Logs -->
+        <div class="lg:col-span-1 flex flex-col gap-8">
+            <!-- Donut -->
+            <div class="card p-6 h-80 relative">
+                <h2 class="text-xl font-bold text-white mb-2 flex items-center gap-2">
+                    <span class="w-1.5 h-6 bg-purple-500 rounded-sm shadow-[0_0_10px_#a855f7]"></span> Attack Distribution
+                </h2>
+                <div id="distributionChart" class="h-[calc(100%-2rem)] -ml-4"></div>
+                <div id="donutEmpty" class="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    <span class="text-gray-600 text-sm font-mono">WAITING FOR DATA...</span>
+                </div>
+            </div>
+
+            <!-- Alerts -->
+            <div class="card p-6 min-h-[400px] flex flex-col">
+                <h2 class="text-xl font-bold text-white mb-4 flex items-center gap-2">
+                    <span class="w-1.5 h-6 bg-rose-500 rounded-sm shadow-[0_0_10px_#f43f5e]"></span> Recent Alerts
+                </h2>
+                <div id="alert-log" class="flex-1 overflow-y-auto space-y-2 pr-2">
+                    <div class="text-gray-600 text-sm italic text-center mt-20 font-mono">
+                        System ready. Waiting for live traffic...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ----- Config -----
+        const MAX_LOGS = 120;
+        const CHART_HISTORY = 60; // seconds
+
+        // ----- Elements -----
+        const els = {
+            conn: document.getElementById('connIndicator'),
+            wsUrl: document.getElementById('wsUrl'),
+            apiKey: document.getElementById('apiKey'),
+            toggle: document.getElementById('toggleBtn'),
+            health: document.getElementById('healthBtn'),
+            statusCard: document.getElementById('statusCard'),
+            statusText: document.getElementById('statusText'),
+            confText: document.getElementById('confText'),
+            flowsText: document.getElementById('flowsText'),
+            attacksText: document.getElementById('attacksText'),
+            log: document.getElementById('alert-log'),
+            donutOverlay: document.getElementById('donutEmpty')
+        };
+
+        // ----- State -----
+        let socket = null;
+        let stats = {
+            total: 0,
+            attacks: 0,
+            benign: 0,
+            classes: {}
+        };
+        let history = {
+            benign: Array(CHART_HISTORY).fill(0),
+            malicious: Array(CHART_HISTORY).fill(0)
+        };
+        let perSecond = {
+            benign: 0,
+            malicious: 0
+        };
+
+        // ----- Apex Defaults -----
+        window.Apex = {
+            chart: {
+                animations: {
+                    enabled: false
+                },
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace'
+            }
+        };
+
+        // Traffic area chart
+        const trafficChart = new ApexCharts(document.querySelector("#trafficChart"), {
+            chart: {
+                type: 'area',
+                height: '100%',
+                background: 'transparent',
+                toolbar: {
+                    show: false
+                },
+                animations: {
+                    enabled: false
+                }
+            },
+            theme: {
+                mode: 'dark'
+            },
+            colors: ['#10b981', '#f43f5e'],
+            fill: {
+                type: 'gradient',
+                gradient: {
+                    shadeIntensity: 1,
+                    opacityFrom: 0.4,
+                    opacityTo: 0.05,
+                    stops: [0, 90, 100]
+                }
+            },
+            stroke: {
+                curve: 'smooth',
+                width: 2
+            },
+            dataLabels: {
+                enabled: false
+            },
+            series: [{
+                name: 'Benign',
+                data: [...history.benign]
+            }, {
+                name: 'Malicious',
+                data: [...history.malicious]
+            }],
+            xaxis: {
+                labels: {
+                    show: false
+                },
+                tooltip: {
+                    enabled: false
+                },
+                axisBorder: {
+                    show: false
+                },
+                axisTicks: {
+                    show: false
+                }
+            },
+            yaxis: {
+                min: 0,
+                labels: {
+                    formatter: (v) => v.toFixed(0)
+                }
+            },
+            grid: {
+                borderColor: '#374151',
+                strokeDashArray: 4,
+                padding: {
+                    left: 10
+                }
+            },
+            legend: {
+                show: false
+            }
+        });
+        trafficChart.render();
+
+        // Distribution donut
+        const distChart = new ApexCharts(document.querySelector("#distributionChart"), {
+            chart: {
+                type: 'donut',
+                height: '100%',
+                background: 'transparent',
+                animations: {
+                    enabled: false
+                }
+            },
+            theme: {
+                mode: 'dark'
+            },
+            series: [],
+            labels: [],
+            // ensure BENIGN is green first if present
+            colors: ['#10b981', '#3b82f6', '#8b5cf6', '#f43f5e', '#f59e0b', '#06b6d4', '#a3e635', '#f97316', '#22d3ee', '#ef4444'],
+            plotOptions: {
+                pie: {
+                    donut: {
+                        size: '70%',
+                        labels: {
+                            show: true,
+                            total: {
+                                show: true,
+                                label: 'Total',
+                                color: '#9ca3af',
+                                formatter: w => w.globals.seriesTotals.reduce((a, b) => a + b, 0)
+                            }
+                        }
+                    }
+                }
+            },
+            dataLabels: {
+                enabled: false
+            },
+            legend: {
+                position: 'bottom',
+                labels: {
+                    colors: '#9ca3af'
+                }
+            },
+            stroke: {
+                show: false
+            }
+        });
+        distChart.render();
+
+        // Shift charts every 1s
+        setInterval(() => {
+            history.benign.push(perSecond.benign);
+            history.benign.shift();
+            history.malicious.push(perSecond.malicious);
+            history.malicious.shift();
+            perSecond = {
+                benign: 0,
+                malicious: 0
+            };
+
+            trafficChart.updateSeries([{
+                data: [...history.benign]
+            }, {
+                data: [...history.malicious]
+            }]).catch(() => {});
+
+            const labels = Object.keys(stats.classes);
+            const series = Object.values(stats.classes);
+            if (series.length) {
+                els.donutOverlay.style.display = 'none';
+                distChart.updateOptions({
+                    labels
+                });
+                distChart.updateSeries(series);
+            }
+        }, 1000);
+
+        // ----- UI helpers -----
+        function setOnline() {
+            els.toggle.textContent = 'DISCONNECT';
+            els.toggle.classList.replace('bg-blue-600', 'bg-rose-600');
+            els.toggle.classList.replace('hover:bg-blue-500', 'hover:bg-rose-500');
+            els.conn.classList.remove('bg-red-500');
+            els.conn.classList.add('bg-emerald-500', 'shadow-lg', 'shadow-emerald-500/50');
+        }
+
+        function setOffline() {
+            els.toggle.textContent = 'CONNECT';
+            els.toggle.classList.replace('bg-rose-600', 'bg-blue-600');
+            els.toggle.classList.replace('hover:bg-rose-500', 'hover:bg-blue-500');
+            els.conn.classList.remove('bg-emerald-500', 'shadow-lg', 'shadow-emerald-500/50');
+            els.conn.classList.add('bg-red-500');
+        }
+
+        function labelIsBenign(label) {
+            if (!label) return false;
+            const l = label.toString().toLowerCase();
+            return l.startsWith('benign') || l.includes('whitelist') || l.includes('low_conf');
+        }
+
+        function logItem(data) {
+            const isThreat = data.intrusion_detected === true;
+            const time = new Date().toLocaleTimeString();
+            // if low_conf or whitelist, treat as benign styling
+            const labelText = data.predicted_class || 'UNKNOWN';
+            const isBenignLabel = labelIsBenign(labelText);
+            const div = document.createElement('div');
+            div.className = `p-3 rounded-lg border-l-4 ${(!isThreat || isBenignLabel) ? 'bg-emerald-900/10 border-emerald-500 hover:bg-emerald-900/20':'bg-rose-900/10 border-rose-500 hover:bg-rose-900/20'} flex justify-between items-center transition-colors`;
+            div.innerHTML = `
+        <div class="flex flex-col">
+          <span class="font-bold text-sm ${(isBenignLabel ? 'text-emerald-400':'text-rose-400')} uppercase tracking-wider">${labelText}</span>
+          <span class="text-[10px] text-gray-500 font-mono mt-0.5">${time}</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs font-mono text-gray-400">CONF:</span>
+          <span class="text-xs font-bold font-mono ${(data.confidence > .8 ? 'text-white':'text-gray-400')}">${(data.confidence*100).toFixed(0)}%</span>
+        </div>`;
+            const first = els.log.children[0];
+            if (first && first.classList.contains('text-center')) els.log.innerHTML = '';
+            els.log.prepend(div);
+            if (els.log.children.length > MAX_LOGS) els.log.lastElementChild.remove();
+        }
+
+        function updateStatus(d) {
+            document.getElementById('flowsText').textContent = stats.total.toLocaleString();
+            document.getElementById('attacksText').textContent = stats.attacks.toLocaleString();
+            document.getElementById('confText').textContent = (d.confidence * 100).toFixed(1) + '%';
+            if (d.intrusion_detected && !labelIsBenign(d.predicted_class)) {
+                els.statusCard.className = "card p-6 flex items-center justify-between status-danger";
+                els.statusText.textContent = `ALERT: ${d.predicted_class}`;
+                els.statusText.className = "text-xl font-bold mt-1 text-rose-500 animate-pulse";
+            } else {
+                els.statusCard.className = "card p-6 flex items-center justify-between status-secure";
+                els.statusText.textContent = "SECURE";
+                els.statusText.className = "text-2xl font-black mt-1 text-emerald-400 tracking-tight";
+            }
+        }
+
+        // ----- WebSocket handling -----
+        function buildWsUrl() {
+            const base = els.wsUrl.value.trim();
+            const key = els.apiKey.value.trim();
+            if (!key) return base;
+            // append ?key=... or &key=... depending on presence of query
+            return base.includes('?') ? `${base}&key=${encodeURIComponent(key)}` : `${base}?key=${encodeURIComponent(key)}`;
+        }
+
+        function connect() {
+            if (socket) {
+                socket.close();
+                socket = null;
+            }
+            let url = buildWsUrl();
+            try {
+                socket = new WebSocket(url);
+            } catch (e) {
+                alert("Invalid WebSocket URL");
+                return;
+            }
+            setOnline();
+
+            socket.onopen = () => {
+                logItem({
+                    predicted_class: "SYSTEM CONNECTED",
+                    intrusion_detected: false,
+                    confidence: 1
+                });
+            };
+            socket.onmessage = (ev) => {
+                try {
+                    const msg = JSON.parse(ev.data);
+                    if (msg && msg.type === "prediction" && msg.data) {
+                        const d = msg.data;
+                        // update counters
+                        stats.total++;
+                        // apply same benign label recognition as UI
+                        const isBenignLabel = labelIsBenign(d.predicted_class);
+                        if (d.intrusion_detected && !isBenignLabel) {
+                            stats.attacks++;
+                            perSecond.malicious++;
+                        } else {
+                            stats.benign++;
+                            perSecond.benign++;
+                        }
+                        stats.classes[d.predicted_class] = (stats.classes[d.predicted_class] || 0) + 1;
+
+                        // paint UI
+                        requestAnimationFrame(() => {
+                            updateStatus(d);
+                            logItem(d);
+                        });
+                    }
+                } catch (e) { /* ignore parse errors */ }
+            };
+            socket.onclose = setOffline;
+            socket.onerror = setOffline;
+        }
+
+        function toggle() {
+            if (socket) {
+                socket.close();
+                socket = null;
+                setOffline();
+            } else {
+                connect();
+            }
+        }
+
+        // ----- Health check (/healthz via HTTP) -----
+        async function healthCheck() {
+            try {
+                const httpBase = (els.wsUrl.value.trim() || "ws://127.0.0.1:8000/ws")
+                    .replace(/^ws(s)?:\/\//, (m, s) => s ? "https://" : "http://")
+                    .replace(/\/ws(\?.*)?$/, ""); // strip /ws
+                const r = await fetch(`${httpBase}/healthz`, {
+                    cache: "no-store"
+                });
+                const j = await r.json();
+                logItem({
+                    predicted_class: j.status === "ok" ? "HEALTH OK" : "HEALTH ERROR",
+                    intrusion_detected: j.status !== "ok",
+                    confidence: 1.0
+                });
+                if (j.id2label) {
+                    // show label info in log for sanity
+                    const keys = Object.keys(j.id2label).slice(0, 5).map(k => `${k}:${j.id2label[k]}`).join(", ");
+                    logItem({
+                        predicted_class: `LABELS: ${keys}...`,
+                        intrusion_detected: false,
+                        confidence: 1.0
+                    });
+                }
+            } catch (e) {
+                logItem({
+                    predicted_class: "HEALTH CHECK FAILED",
+                    intrusion_detected: true,
+                    confidence: 1.0
+                });
+            }
+        }
+
+        // ----- Wire up -----
+        document.getElementById('toggleBtn').onclick = toggle;
+        document.getElementById('healthBtn').onclick = healthCheck;
+    </script>
+</body>
+
+</html>
