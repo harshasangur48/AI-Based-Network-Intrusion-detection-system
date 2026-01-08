@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""
+live_pyshark_sensor.py (patched)
+
+Patched to:
+ - extract small TCP/UDP payload samples (best-effort)
+ - skip multicast and link-local flows (reduces noisy flows like mDNS/ND)
+ - ensure IPv6 TCP/UDP ports are captured
+ - include sanitized payload_samples (hex strings) in _meta so backend/verifier can use them
+ - add simple API backoff to avoid spamming when /predict_flow/ is down
+
+Usage remains the same. Run with --debug to see payloads and server responses.
+"""
+import argparse
+import threading
+import time
+import json
+import requests
+import traceback
+from collections import namedtuple
+from statistics import mean, pstdev
+
+try:
+    import pyshark
+except Exception:
+    raise RuntimeError("pyshark import failed. Install it via `pip install pyshark` and ensure tshark is installed.")
+
+FlowKey = namedtuple("FlowKey", ["src", "dst", "sport", "dport", "proto"])
+
+class Flow:
+    def __init__(self, key, ts):
+        self.key = key
+        self.start = ts
+        self.last = ts
+        self.pkts = 0
+        self.bytes = 0
+        self.pkt_sizes = []
+        self.iat = []
+        self.prev_ts = None
+        self.payload_samples = []
+
+    def add_packet(self, ts, size, payload=None):
+        if self.prev_ts is not None:
+            self.iat.append(ts - self.prev_ts)
+        self.prev_ts = ts
+        self.last = ts
+        self.pkts += 1
+        self.bytes += size
+        self.pkt_sizes.append(size)
+        if payload and len(self.payload_samples) < 3:
+            try:
+                # store raw bytes here temporarily; will be sanitized later
+                self.payload_samples.append(payload)
+            except Exception:
+                pass
+
+    def is_expired(self, now, timeout):
+        return (now - self.last) >= timeout
+
+    def features_dict(self):
+        dur = max(0.000001, self.last - self.start)
+        avg_pkt = mean(self.pkt_sizes) if self.pkt_sizes else 0.0
+        std_pkt = pstdev(self.pkt_sizes) if len(self.pkt_sizes) > 1 else 0.0
+        iat_mean = mean(self.iat) if self.iat else 0.0
+        iat_std = pstdev(self.iat) if len(self.iat) > 1 else 0.0
+        pkts_per_sec = self.pkts / dur if dur > 0 else 0.0
+        bytes_per_sec = self.bytes / dur if dur > 0 else 0.0
+
+        return {
+            "duration": dur,
+            "total_packets": self.pkts,
+            "total_bytes": self.bytes,
+            "avg_pkt_size": avg_pkt,
+            "std_pkt_size": std_pkt,
+            "iat_mean": iat_mean,
+            "iat_std": iat_std,
+            "pkts_per_sec": pkts_per_sec,
+            "bytes_per_sec": bytes_per_sec,
+            "src_port": int(self.key.sport) if self.key.sport is not None else 0,
+            "dst_port": int(self.key.dport) if self.key.dport is not None else 0,
+            "protocol": int(self.key.proto) if self.key.proto is not None else 0,
+        }
+
+
+def parse_packet(pkt):
+    """
+    Extract 5-tuple + timestamp + size + small payload from a pyshark live packet.
+    Returns (FlowKey, ts, size, payload_bytes) or (None, None, None, None).
+    """
+    try:
+        ts = float(pkt.sniff_timestamp)
+        src = dst = None
+        proto = 0
+        sport = None
+        dport = None
+
+        # IPv4
+        if hasattr(pkt, "ip"):
+            ip = pkt.ip
+            src = getattr(ip, "src", None)
+            dst = getattr(ip, "dst", None)
+            # check transport layers
+            if hasattr(pkt, "tcp"):
+                proto = 6
+                sport = getattr(pkt.tcp, "srcport", None) or getattr(pkt.tcp, "src_port", None)
+                dport = getattr(pkt.tcp, "dstport", None) or getattr(pkt.tcp, "dst_port", None)
+            elif hasattr(pkt, "udp"):
+                proto = 17
+                sport = getattr(pkt.udp, "srcport", None) or getattr(pkt.udp, "src_port", None)
+                dport = getattr(pkt.udp, "dstport", None) or getattr(pkt.udp, "dst_port", None)
+            else:
+                try:
+                    proto = int(ip.proto)
+                except Exception:
+                    proto = 0
+
+        # IPv6
+        elif hasattr(pkt, "ipv6") or hasattr(pkt, "IPV6") or "IPv6" in str(pkt):
+            ip = getattr(pkt, "ipv6", None)
+            if ip is None:
+                try:
+                    ip = pkt.get_field_by_showname("IPv6")
+                except Exception:
+                    ip = None
+            if ip:
+                src = getattr(ip, "src", None)
+                dst = getattr(ip, "dst", None)
+                try:
+                    proto = int(getattr(ip, "nxt", getattr(ip, "nh", 0)))
+                except Exception:
+                    proto = 0
+                if hasattr(pkt, "tcp"):
+                    proto = 6
+                    sport = getattr(pkt.tcp, "srcport", None) or getattr(pkt.tcp, "src_port", None)
+                    dport = getattr(pkt.tcp, "dstport", None) or getattr(pkt.tcp, "dst_port", None)
+                elif hasattr(pkt, "udp"):
+                    proto = 17
+                    sport = getattr(pkt.udp, "srcport", None) or getattr(pkt.udp, "src_port", None)
+                    dport = getattr(pkt.udp, "dstport", None) or getattr(pkt.udp, "dst_port", None)
+        else:
+            return None, None, None, None
+
+        # packet size (best effort)
+        size = 0
+        for attr in ("length", "frame_len", "frame_info.len", "frame.len"):
+            try:
+                if "." in attr:
+                    a, b = attr.split(".", 1)
+                    val = getattr(pkt, a)
+                    for part in b.split("."):
+                        val = getattr(val, part)
+                    size = int(val)
+                    break
+                else:
+                    if hasattr(pkt, attr):
+                        size = int(getattr(pkt, attr))
+                        break
+            except Exception:
+                continue
+
+        # normalize ports -> ints (0 fallback)
+        try:
+            sport = int(sport) if sport is not None else 0
+        except:
+            sport = 0
+        try:
+            dport = int(dport) if dport is not None else 0
+        except:
+            dport = 0
+        try:
+            proto = int(proto) if proto is not None else 0
+        except:
+            proto = 0
+
+        # best-effort payload extraction (tcp/udp)
+        payload = None
+        try:
+            if proto in (6, 17):
+                if hasattr(pkt, "tcp") and hasattr(pkt.tcp, "payload"):
+                    hexstr = str(pkt.tcp.payload)
+                    if hexstr:
+                        hexstr = hexstr.replace(":", "").strip()
+                        if len(hexstr) >= 2:
+                            # convert only first up to 200 bytes (400 hex chars)
+                            payload = bytes.fromhex(hexstr[:200*2])
+                elif hasattr(pkt, "udp") and hasattr(pkt.udp, "payload"):
+                    hexstr = str(pkt.udp.payload)
+                    if hexstr:
+                        hexstr = hexstr.replace(":", "").strip()
+                        if len(hexstr) >= 2:
+                            payload = bytes.fromhex(hexstr[:200*2])
+        except Exception:
+            payload = None
+
+        key = FlowKey(src=src, dst=dst, sport=sport, dport=dport, proto=proto)
+        return key, ts, size, payload
+
+    except Exception:
+        return None, None, None, None
+
+class ExactSensor:
+    def __init__(self, iface, api_url, flow_timeout=3.0, max_flows=4000, bpf_filter=None, total=None, debug=False):
+        self.iface = iface
+        self.api_url = api_url.rstrip("/")
+        self.flow_timeout = float(flow_timeout)
+        self.max_flows = int(max_flows)
+        self.bpf_filter = bpf_filter
+        self.debug = debug
+
+        self.flows = {}          # key -> Flow
+        self.lock = threading.Lock()
+        self.running = False
+
+        self.session = requests.Session()
+        self.feature_order = None  # list or None
+        self.api_shape = {'type': 'dict', 'order': None, 'raw': None}
+
+        self.count = 0
+        # keep storing provided total but we will not print "?" anymore
+        self.total = total
+
+        # api health & backoff
+        self.api_up = True
+        self.fail_count = 0
+
+        # probe /healthz to learn expected feature names
+        self._probe_health()
+
+        # create sweeper thread (looks for expired flows)
+        self.sweeper = threading.Thread(target=self._sweeper_loop, daemon=True)
+
+    def _probe_health(self):
+        url = f"{self.api_url}/healthz"
+        try:
+            r = self.session.get(url, timeout=4)
+            r.raise_for_status()
+            j = r.json()
+            self.api_shape['raw'] = j
+            candidates = []
+            for k in ("feature_names_in_", "feature_order", "feature_names", "expected_features", "features", "feature_list", "feature_names_list"):
+                if k in j:
+                    candidates.append(j[k])
+            def deep_find(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if isinstance(v, (list, tuple)) and v and all(isinstance(x, str) for x in v):
+                            candidates.append(v)
+                        else:
+                            deep_find(v)
+            deep_find(j)
+            chosen = None
+            for c in candidates:
+                if isinstance(c, str):
+                    try:
+                        parsed = json.loads(c)
+                        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+                            chosen = parsed
+                            break
+                    except:
+                        continue
+                elif isinstance(c, (list, tuple)) and all(isinstance(x, str) for x in c):
+                    chosen = list(c)
+                    break
+            if chosen:
+                self.feature_order = chosen
+                self.api_shape['type'] = 'dict'
+                self.api_shape['order'] = chosen
+                if self.debug:
+                    print("[HEALTH] Found feature order (len={}):".format(len(chosen)))
+                    print(json.dumps(chosen[:20], indent=2))
+            else:
+                if self.debug:
+                    print("[HEALTH] No explicit feature list in /healthz. Proceeding with best-effort features.")
+        except Exception as e:
+            if self.debug:
+                print("[HEALTH] Could not fetch /healthz:", e)
+            # leave feature_order None
+
+    def _send_post(self, payload):
+        """
+        Send payload to /predict_flow and print formatted result line.
+        Implements simple backoff if API repeatedly refuses connection.
+        """
+        try:
+            if not self.api_up:
+                # small sleep to avoid busy loop
+                time.sleep(1)
+            r = self.session.post(f"{self.api_url.rstrip('/')}/predict_flow/", json=payload, timeout=6)
+        except requests.exceptions.RequestException as e:
+            # network error or server unreachable
+            self.fail_count += 1
+            if self.fail_count > 5:
+                self.api_up = False
+                if self.debug:
+                    print("[API] repeated failures, pausing posts for 10s")
+                time.sleep(10)
+                self.api_up = True
+                self.fail_count = 0
+            self.count += 1
+            idx = self.count
+            total = self.total if self.total is not None else None
+            msg = f"[POST EXC] {e}"
+            if total is None:
+                print(f"[{idx}] {msg}")
+            else:
+                print(f"[{idx}/{total}] {msg}")
+            return
+
+        self.fail_count = 0
+        self.api_up = True
+
+        self.count += 1
+        idx = self.count
+        total = self.total if self.total is not None else None
+
+        if not r.ok:
+            text = None
+            try:
+                text = r.text
+            except:
+                text = "<no-text>"
+            if total is None:
+                print(f"[{idx}] [POST ERR {r.status_code}] {text}")
+            else:
+                print(f"[{idx}/{total}] [POST ERR {r.status_code}] {text}")
+            return
+
+        try:
+            data = r.json()
+        except Exception:
+            if total is None:
+                print(f"[{idx}] [INVALID JSON] {r.text}")
+            else:
+                print(f"[{idx}/{total}] [INVALID JSON] {r.text}")
+            return
+
+        pred = None
+        conf = None
+        label_keys = ["prediction", "pred", "label", "class", "predicted", "predicted_label"]
+        conf_keys = ["probability", "prob", "confidence", "score", "score_prob"]
+
+        for k in label_keys:
+            if k in data:
+                pred = data[k]
+                break
+        if pred is None:
+            for k, v in data.items():
+                if isinstance(v, str) and len(v) < 80 and ("attack" in k.lower() or "label" in k.lower() or "pred" in k.lower() or "class" in k.lower()):
+                    pred = v
+                    break
+
+        for k in conf_keys:
+            if k in data:
+                conf = data[k]
+                break
+        if conf is None:
+            for v in data.values():
+                if isinstance(v, dict):
+                    for k in conf_keys:
+                        if k in v:
+                            conf = v[k]
+                            break
+                if conf is not None:
+                    break
+
+        pred_text = str(pred).strip() if pred is not None else "UNKNOWN"
+        pred_display = pred_text.upper() if pred_text.isalpha() else pred_text
+
+        conf_val = None
+        try:
+            if conf is not None:
+                conf_val = float(conf)
+        except Exception:
+            conf_val = None
+
+        pred_lower = pred_text.lower()
+        if "benign" in pred_lower or "normal" in pred_lower:
+            emoji = "🟢"
+            label_out = "BENIGN"
+        else:
+            emoji = "🔴"
+            label_out = pred_text
+
+        conf_text = f"{conf_val:.2f}" if conf_val is not None else "N/A"
+
+        if total is None:
+            print(f"[{idx}] {emoji} {label_out} (conf={conf_text})")
+        else:
+            print(f"[{idx}/{total}] {emoji} {label_out} (conf={conf_text})")
+
+        if self.debug:
+            try:
+                print("  >> server:", json.dumps(data, indent=2)[:800])
+            except Exception:
+                print("  >> server (raw):", data)
+
+    def _finalize_and_send(self, flow: Flow):
+        base = flow.features_dict()
+
+        # Sanitize payload samples to JSON-friendly strings (hex)
+        sanitized_payloads = []
+        for sample in (flow.payload_samples or [])[:3]:
+            try:
+                if isinstance(sample, (bytes, bytearray)):
+                    # hex representation (short)
+                    h = sample[:200].hex()
+                    sanitized_payloads.append(h)
+                else:
+                    # fallback: convert to string and truncate
+                    s = str(sample)
+                    sanitized_payloads.append(s[:400])
+            except Exception:
+                sanitized_payloads.append("")
+
+        meta = {
+            "src": flow.key.src, "dst": flow.key.dst,
+            "sport": flow.key.sport, "dport": flow.key.dport,
+            "proto": flow.key.proto,
+            "start": flow.start, "end": flow.last,
+            # include sanitized payloads (strings) so JSON serialization is safe
+            "payload_samples": sanitized_payloads
+        }
+
+        if self.feature_order:
+            d = {}
+            for fname in self.feature_order:
+                if fname in base:
+                    val = base[fname]
+                else:
+                    lname = fname.lower()
+                    if lname in base:
+                        val = base[lname]
+                    else:
+                        syn = {
+                            "flow_duration": "duration", "duration_seconds": "duration",
+                            "packet_count": "total_packets", "pkts": "total_packets",
+                            "byte_count": "total_bytes", "bytes": "total_bytes",
+                            "avg_len": "avg_pkt_size", "mean_len": "avg_pkt_size",
+                            "std_len": "std_pkt_size"
+                        }
+                        if fname in syn and syn[fname] in base:
+                            val = base[syn[fname]]
+                        else:
+                            val = 0.0
+                d[fname] = val
+            payload = {"features": d, "_meta": meta}
+        else:
+            payload = {"features": base, "_meta": meta}
+
+        if self.debug:
+            try:
+                # if payload too large, print first part only
+                print("\n[POST PAYLOAD SAMPLE]", json.dumps(payload, indent=2)[:1200])
+            except Exception:
+                print("[POST PAYLOAD SAMPLE] (could not render)")
+
+        threading.Thread(target=self._send_post, args=(payload,), daemon=True).start()
+
+    def _is_useless_flow(self, key: FlowKey) -> bool:
+        try:
+            # skip IPv6 multicast (ff00::/8) and link-local fe80::/10
+            if isinstance(key.src, str) and key.src.lower().startswith("ff") and ":" in key.src:
+                return True
+            if isinstance(key.dst, str) and key.dst.lower().startswith("ff") and ":" in key.dst:
+                return True
+            if isinstance(key.src, str) and key.src.lower().startswith("fe80"):
+                return True
+            if isinstance(key.dst, str) and key.dst.lower().startswith("fe80"):
+                return True
+        except:
+            pass
+        if key.sport == 0 and key.dport == 0 and key.proto not in (6, 17):
+            return True
+        return False
+
+    def _sweeper_loop(self):
+        while True:
+            if not getattr(self, "running", False):
+                break
+            try:
+                now = time.time()
+                expired = []
+                with self.lock:
+                    for k, f in list(self.flows.items()):
+                        if f.is_expired(now, self.flow_timeout):
+                            expired.append((k, f))
+                            del self.flows[k]
+                for _, flow in expired:
+                    try:
+                        self._finalize_and_send(flow)
+                    except Exception:
+                        traceback.print_exc()
+                time.sleep(0.5)
+            except Exception:
+                traceback.print_exc()
+                time.sleep(1)
+
+    def start(self):
+        self.running = True
+        self.sweeper.start()
+        print(f"[+] Capture iface={self.iface} filter={self.bpf_filter} timeout={self.flow_timeout}s")
+        capture = pyshark.LiveCapture(interface=self.iface, bpf_filter=self.bpf_filter)
+        try:
+            for pkt in capture.sniff_continuously():
+                try:
+                    key, ts, size, payload = parse_packet(pkt)
+                    if key is None:
+                        continue
+                    # skip trivial/multicast flows
+                    if self._is_useless_flow(key):
+                        if self.debug:
+                            # Uncomment to log skipped flows in debug
+                            # print("Skipping useless flow:", key)
+                            pass
+                        continue
+                    with self.lock:
+                        if key not in self.flows:
+                            if len(self.flows) >= self.max_flows:
+                                if self.debug:
+                                    print("Dropping new flow (max_flows reached):", key)
+                                continue
+                            self.flows[key] = Flow(key, ts)
+                        self.flows[key].add_packet(ts, size, payload)
+                except KeyboardInterrupt:
+                    break
+                except Exception:
+                    if self.debug:
+                        traceback.print_exc()
+                    continue
+        except KeyboardInterrupt:
+            pass
+        finally:
+            print("\nStopping capture, flushing remaining flows...")
+            self.running = False
+            with self.lock:
+                remaining = list(self.flows.values())
+                self.flows.clear()
+            for f in remaining:
+                try:
+                    self._finalize_and_send(f)
+                except Exception:
+                    traceback.print_exc()
+            print("Done.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Live pyshark sensor that matches API feature order exactly and prints friendly labels.")
+    parser.add_argument("--iface", required=True, help="Capture interface (e.g., wlan0, eth0, 'Wi-Fi')")
+    parser.add_argument("--api", required=True, help="Base URL of NIDS API (e.g., http://127.0.0.1:8000)")
+    parser.add_argument("--flow-timeout", type=float, default=3.0, help="Seconds of inactivity to close flow")
+    parser.add_argument("--max-flows", type=int, default=4000, help="Maximum concurrent flows to track")
+    parser.add_argument("--filter", dest="bpf", default=None, help="BPF capture filter (optional)")
+    parser.add_argument("--total", type=int, default=None, help="(Optional) total number of flows for display (e.g. 375854)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug prints (payload + server response)")
+    args = parser.parse_args()
+
+    sensor = ExactSensor(iface=args.iface, api_url=args.api, flow_timeout=args.flow_timeout,
+                         max_flows=args.max_flows, bpf_filter=args.bpf, total=args.total, debug=args.debug)
+    sensor.start()
+
+if __name__ == "__main__":
+    main()
+
